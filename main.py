@@ -51,27 +51,38 @@ def download_from_gcs(gcs_uri: str, output_path: str) -> str:
 
 def stitch_videos_ffmpeg(video_paths: list[str], output_path: str, crossfade_sec: int):
     """
-    Native ffmpeg xfade filter — single pass, no intermediate disk write.
+    Native ffmpeg xfade filter with auto-safe crossfade duration.
+    Caps crossfade to 40% of shortest clip to prevent negative offsets
+    which break xfade when crossfade_sec is close to clip duration.
     """
     if len(video_paths) == 1:
         subprocess.run(["cp", video_paths[0], output_path], check=True)
         return
+
+    # Get duration of all clips upfront
+    durations = []
+    for p in video_paths:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", p],
+            capture_output=True, text=True
+        )
+        durations.append(float(probe.stdout.strip()))
+
+    # Auto-cap crossfade to 40% of shortest clip to prevent negative offsets
+    min_duration = min(durations)
+    safe_crossfade = min(crossfade_sec, int(min_duration * 0.4))
+    logger.info(f"Using crossfade of {safe_crossfade}s (requested {crossfade_sec}s, shortest clip {min_duration:.1f}s)")
 
     filter_parts = []
     prev_label = "0:v"
     total_offset = 0.0
 
     for i in range(1, len(video_paths)):
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", video_paths[i - 1]],
-            capture_output=True, text=True
-        )
-        clip_duration = float(probe.stdout.strip())
-        total_offset += clip_duration - crossfade_sec
+        total_offset += durations[i - 1] - safe_crossfade
         out_label = f"v{i:02d}"
         filter_parts.append(
-            f"[{prev_label}][{i}:v]xfade=transition=fade:duration={crossfade_sec}"
+            f"[{prev_label}][{i}:v]xfade=transition=fade:duration={safe_crossfade}"
             f":offset={total_offset:.3f}[{out_label}]"
         )
         prev_label = out_label
@@ -89,11 +100,13 @@ def stitch_videos_ffmpeg(video_paths: list[str], output_path: str, crossfade_sec
         "-an",
         "-c:v", "libx264",
         "-preset", "ultrafast",
+        "-crf", "28",       # faster encode with acceptable quality
         "-threads", "0",
         output_path
     ]
     logger.info(f"Stitching {len(video_paths)} clips with ffmpeg xfade...")
     subprocess.run(cmd, check=True)
+    logger.info("Stitch complete")
 
 
 def generate_srt(sentences: list[str], total_duration: float, output_path: str):
@@ -169,8 +182,8 @@ def process_video_job(job: RenderJob):
         stitch_videos_ffmpeg(video_paths, stitched_path, job.crossfade_time)
 
         # 3. BUILD AUDIO MIX (single ffmpeg pass)
-        # Replaces slow numpy/MoviePy approach — generates tone and mixes
-        # everything natively in ffmpeg, drops this step from ~10min to <30sec
+        # Generates tone and mixes everything natively in ffmpeg.
+        # Drops this step from ~10min (MoviePy/numpy) to under 30sec.
         logger.info("Mixing audio...")
         mixed_audio_path = f"{work_dir}/mixed_audio.aac"
         cmd = [
