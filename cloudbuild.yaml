@@ -24,3 +24,5 @@ steps:
       - '--set-env-vars=BUCKET_NAME=your-bucket-name,IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg'
 images:
   - 'gcr.io/testllm-455015/meditation-engine'
+options:
+  logging: CLOUD_LOGGING_ONLY
