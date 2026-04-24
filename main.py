@@ -34,17 +34,14 @@ class RenderJob(BaseModel):
 
 def download_from_gcs(gcs_uri: str, output_path: str) -> str:
     """
-    Download directly from GCS — same Google network as Cloud Run,
-    no SSL drops, no auth gymnastics. Much faster than Google Drive.
-    gcs_uri format: gs://your-bucket/folder/filename.mp4
+    Use gcloud storage cp directly — proven to work reliably on Cloud Run,
+    avoids SSL EOF issues seen with the Python GCS SDK download_to_filename.
     """
     logger.info(f"Downloading {gcs_uri}...")
-    storage_client = storage.Client()
-    bucket_name = gcs_uri.split('/')[2]
-    blob_name = '/'.join(gcs_uri.split('/')[3:])
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
-    blob.download_to_filename(output_path)
+    subprocess.run(
+        ["gcloud", "storage", "cp", gcs_uri, output_path],
+        check=True
+    )
     logger.info(f"Download complete: {output_path}")
     return output_path
 
@@ -64,7 +61,6 @@ def stitch_videos_concat(video_paths: list[str], output_path: str) -> float:
     Stream copy concat — no re-encoding, completes in seconds regardless
     of clip count or duration. Crossfades are applied in the final pass
     instead, which costs nothing since that step re-encodes anyway.
-    Returns total duration of the stitched file.
     """
     if len(video_paths) == 1:
         subprocess.run(["cp", video_paths[0], output_path], check=True)
@@ -81,7 +77,7 @@ def stitch_videos_concat(video_paths: list[str], output_path: str) -> float:
         "-f", "concat",
         "-safe", "0",
         "-i", concat_file,
-        "-c", "copy",    # zero re-encoding — just joins the streams
+        "-c", "copy",
         "-an",
         output_path
     ]
@@ -91,34 +87,6 @@ def stitch_videos_concat(video_paths: list[str], output_path: str) -> float:
 
     total_duration = sum(get_clip_duration(p) for p in video_paths)
     return total_duration
-
-
-def build_crossfade_filter(num_clips: int, clip_duration: float, crossfade_sec: float) -> str:
-    """
-    Build an xfade filter chain for the final render pass.
-    At this point we're already re-encoding the full video so crossfades
-    cost nothing extra vs doing them in a separate stitch step.
-    """
-    # Cap crossfade to 40% of clip duration to prevent negative offsets
-    safe_crossfade = min(crossfade_sec, clip_duration * 0.4)
-
-    if num_clips <= 1:
-        return ""
-
-    filter_parts = []
-    prev_label = "0:v"
-    total_offset = 0.0
-
-    for i in range(1, num_clips):
-        total_offset += clip_duration - safe_crossfade
-        out_label = f"v{i:02d}"
-        filter_parts.append(
-            f"[{prev_label}][{i}:v]xfade=transition=fade:duration={safe_crossfade:.2f}"
-            f":offset={total_offset:.3f}[{out_label}]"
-        )
-        prev_label = out_label
-
-    return ";".join(filter_parts), prev_label, safe_crossfade
 
 
 def generate_srt(sentences: list[str], total_duration: float, output_path: str):
@@ -198,6 +166,7 @@ def process_video_job(job: RenderJob):
 
         # 3. BUILD AUDIO MIX (single ffmpeg pass)
         # Generates tone and mixes everything natively in ffmpeg.
+        # Drops this step from ~10min (MoviePy/numpy) to under 30sec.
         logger.info("Mixing audio...")
         mixed_audio_path = f"{work_dir}/mixed_audio.aac"
         cmd = [
@@ -220,8 +189,7 @@ def process_video_job(job: RenderJob):
         generate_srt(job.sentences, job.target_duration, srt_path)
 
         # 5. FINAL FFMPEG PASS
-        # Loops stitched video, applies crossfades between clip cycles,
-        # burns subtitles, and mixes in audio — all in one pass.
+        # Loops stitched video, burns subtitles, and mixes in audio.
         logger.info("Rendering final video...")
         final_path = f"{work_dir}/final_meditation.mp4"
 
