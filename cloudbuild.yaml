@@ -1,0 +1,25 @@
+cat > cloudbuild.yaml << 'EOF'
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/testllm-455015/meditation-engine', '.']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/testllm-455015/meditation-engine']
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - meditation-engine
+      - --image=gcr.io/testllm-455015/meditation-engine
+      - --region=us-central1
+      - --memory=8Gi
+      - --cpu=4
+      - --timeout=900
+      - --concurrency=1
+      - --set-env-vars=BUCKET_NAME=your-bucket-name,IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg
+
+images:
+  - 'gcr.io/testllm-455015/meditation-engine'
+EOF
