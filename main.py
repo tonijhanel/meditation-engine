@@ -177,22 +177,25 @@ def process_video_job(job: RenderJob):
         stitched_path = f"{work_dir}/stitched.mp4"
         stitch_videos_ffmpeg(video_paths, stitched_path, job.crossfade_time)
 
-       # 3. BUILD AUDIO MIX
+     # 3. BUILD AUDIO MIX
         logger.info("Mixing audio...")
         base_audio = AudioFileClip(audio_path)
         looped_music = afx.audio_loop(base_audio, duration=job.target_duration)
-        looped_music = looped_music.set_duration(job.target_duration)  # explicit set
+        looped_music = looped_music.set_duration(job.target_duration)
 
         sample_rate = 44100
         t = np.linspace(0, job.target_duration, int(sample_rate * job.target_duration), endpoint=False)
         tone_wave = (job.tone_volume * np.sin(2 * np.pi * job.hertz_freq * t)).astype(np.float32)
         tone_stereo = np.column_stack([tone_wave, tone_wave])
         hz_clip = AudioArrayClip(tone_stereo, fps=sample_rate)
-        hz_clip = hz_clip.set_duration(job.target_duration)  # explicit set
+        hz_clip = hz_clip.set_duration(job.target_duration)
 
         final_audio = CompositeAudioClip([looped_music, hz_clip])
-        final_audio = final_audio.set_duration(job.target_duration)  # explicit set on composite too
+        final_audio = final_audio.set_duration(job.target_duration)
 
+        mixed_audio_path = f"{work_dir}/mixed_audio.aac"
+        final_audio.write_audiofile(mixed_audio_path, fps=sample_rate, codec="aac", logger=None)
+        logger.info("Audio mix complete")
 
         # 4. GENERATE SRT SUBTITLES
         srt_path = f"{work_dir}/subs.srt"
