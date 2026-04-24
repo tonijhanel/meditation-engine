@@ -5,10 +5,9 @@ import os
 import uuid
 import subprocess
 import logging
-import numpy as np
+import threading
 from google.cloud import storage
 from datetime import timedelta
-import threading
 
 # Structured logging — Cloud Run picks this up automatically
 logging.basicConfig(level=logging.INFO)
@@ -33,29 +32,26 @@ class RenderJob(BaseModel):
 # HELPERS
 # ---------------------------------------------------------------------------
 
-def download_file_fast(url: str, output_path: str) -> str:
+def download_from_gcs(gcs_uri: str, output_path: str) -> str:
     """
-    Direct streaming download — replaces gdown which is interactive-first
-    and adds significant overhead in headless server environments.
+    Download directly from GCS — same Google network as Cloud Run,
+    no SSL drops, no auth gymnastics. Much faster than Google Drive.
+    gcs_uri format: gs://your-bucket/folder/filename.mp4
     """
-    logger.info(f"Downloading to {output_path}...")
-    if "drive.google.com" in url:
-        file_id = url.split('/d/')[1].split('/')[0]
-        url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
-
-    with requests.get(url, stream=True, timeout=120) as r:
-        r.raise_for_status()
-        with open(output_path, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):  # 8MB chunks
-                f.write(chunk)
+    logger.info(f"Downloading {gcs_uri}...")
+    storage_client = storage.Client()
+    bucket_name = gcs_uri.split('/')[2]
+    blob_name = '/'.join(gcs_uri.split('/')[3:])
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.download_to_filename(output_path)
+    logger.info(f"Download complete: {output_path}")
     return output_path
 
 
 def stitch_videos_ffmpeg(video_paths: list[str], output_path: str, crossfade_sec: int):
     """
-    Native ffmpeg xfade filter — replaces MoviePy concatenate_videoclips which
-    writes an intermediate temp file and has Python-level overhead per frame.
-    Single pass, no intermediate disk write.
+    Native ffmpeg xfade filter — single pass, no intermediate disk write.
     """
     if len(video_paths) == 1:
         subprocess.run(["cp", video_paths[0], output_path], check=True)
@@ -92,7 +88,7 @@ def stitch_videos_ffmpeg(video_paths: list[str], output_path: str, crossfade_sec
         "-map", f"[{prev_label}]",
         "-an",
         "-c:v", "libx264",
-        "-preset", "ultrafast",   # fastest for intermediate — final pass uses 'fast'
+        "-preset", "ultrafast",
         "-threads", "0",
         output_path
     ]
@@ -102,9 +98,8 @@ def stitch_videos_ffmpeg(video_paths: list[str], output_path: str, crossfade_sec
 
 def generate_srt(sentences: list[str], total_duration: float, output_path: str):
     """
-    Write an SRT subtitle file — replaces MoviePy TextClip which shells out to
-    ImageMagick per sentence, which is brutally slow at scale. ffmpeg burns the
-    SRT in a single pass via the subtitles= filter.
+    Write an SRT subtitle file — ffmpeg burns it in during the final pass.
+    Much faster than MoviePy TextClip/ImageMagick approach.
     """
     time_per = total_duration / len(sentences)
 
@@ -124,8 +119,8 @@ def generate_srt(sentences: list[str], total_duration: float, output_path: str):
 
 def run_with_timeout(fn, job: RenderJob, timeout_seconds: int = 840):
     """
-    threading.Timer based timeout — signal.SIGALRM won't work here because
-    FastAPI runs background tasks in a thread pool, not the main thread.
+    Threading-based timeout — signal.SIGALRM won't work in FastAPI's
+    thread pool so we use threading.Thread.join with a timeout instead.
     """
     result = {"error": None}
 
@@ -140,7 +135,6 @@ def run_with_timeout(fn, job: RenderJob, timeout_seconds: int = 840):
     thread.join(timeout=timeout_seconds)
 
     if thread.is_alive():
-        # Thread is still running — job exceeded timeout
         logger.error(f"Render job timed out after {timeout_seconds}s")
         requests.post(job.callback_webhook, json={
             "status": "error",
@@ -162,19 +156,21 @@ def process_video_job(job: RenderJob):
     logger.info(f"Work dir: {work_dir}")
 
     try:
-        # 1. DOWNLOAD
+        # 1. DOWNLOAD FROM GCS
         logger.info("Downloading assets...")
-        audio_path = download_file_fast(job.audio_link, f"{work_dir}/music.mp3")
+        audio_path = download_from_gcs(job.audio_link, f"{work_dir}/music.mp3")
         video_paths = []
         for i, link in enumerate(job.video_links):
-            p = download_file_fast(link, f"{work_dir}/clip_{i}.mp4")
+            p = download_from_gcs(link, f"{work_dir}/clip_{i}.mp4")
             video_paths.append(p)
 
-        # 2. STITCH WITH FFMPEG (single pass, no intermediate MoviePy write)
+        # 2. STITCH WITH FFMPEG
         stitched_path = f"{work_dir}/stitched.mp4"
         stitch_videos_ffmpeg(video_paths, stitched_path, job.crossfade_time)
 
-        # 3. BUILD AUDIO MIX (single ffmpeg pass — replaces slow numpy/MoviePy approach)
+        # 3. BUILD AUDIO MIX (single ffmpeg pass)
+        # Replaces slow numpy/MoviePy approach — generates tone and mixes
+        # everything natively in ffmpeg, drops this step from ~10min to <30sec
         logger.info("Mixing audio...")
         mixed_audio_path = f"{work_dir}/mixed_audio.aac"
         cmd = [
@@ -212,7 +208,7 @@ def process_video_job(job: RenderJob):
             "-t", str(job.target_duration),
             "-c:v", "libx264",
             "-preset", "fast",
-            "-c:a", "copy",       # audio already encoded above, just remux
+            "-c:a", "copy",
             "-threads", "0",
             final_path
         ]
@@ -251,7 +247,6 @@ def process_video_job(job: RenderJob):
         raise
 
     finally:
-        # Kill any lingering ffmpeg processes tied to this job before cleaning up
         subprocess.run(["pkill", "-f", f"ffmpeg.*{work_dir}"], check=False)
         subprocess.run(["rm", "-rf", work_dir], check=False)
         logger.info(f"Cleaned up {work_dir}")

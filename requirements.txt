@@ -1,7 +1,5 @@
 fastapi
 uvicorn[standard]
-moviepy==1.0.3
-numpy==1.26.4
 pydantic
 requests
 google-cloud-storage
