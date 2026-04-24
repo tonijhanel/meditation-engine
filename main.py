@@ -177,7 +177,7 @@ def process_video_job(job: RenderJob):
         stitched_path = f"{work_dir}/stitched.mp4"
         stitch_videos_ffmpeg(video_paths, stitched_path, job.crossfade_time)
 
-     # 3. BUILD AUDIO MIX
+        # 3. BUILD AUDIO MIX
         logger.info("Mixing audio...")
         base_audio = AudioFileClip(audio_path)
         looped_music = afx.audio_loop(base_audio, duration=job.target_duration)
