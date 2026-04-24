@@ -23,7 +23,7 @@ class RenderJob(BaseModel):
     callback_webhook: str
 
     target_duration: int = Field(default=600, description="Total video length in seconds")
-    crossfade_time: int = Field(default=3, description="Crossfade transition time in seconds")
+    crossfade_time: int = Field(default=1, description="Crossfade transition time in seconds")
     hertz_freq: float = Field(default=432.0, description="Healing frequency tone")
     tone_volume: float = Field(default=0.15, description="Volume of the frequency tone (0.0 to 1.0)")
 
@@ -49,64 +49,76 @@ def download_from_gcs(gcs_uri: str, output_path: str) -> str:
     return output_path
 
 
-def stitch_videos_ffmpeg(video_paths: list[str], output_path: str, crossfade_sec: int):
+def get_clip_duration(video_path: str) -> float:
+    """Get duration of a video clip using ffprobe."""
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+        capture_output=True, text=True
+    )
+    return float(probe.stdout.strip())
+
+
+def stitch_videos_concat(video_paths: list[str], output_path: str) -> float:
     """
-    Native ffmpeg xfade filter with auto-safe crossfade duration.
-    Caps crossfade to 40% of shortest clip to prevent negative offsets
-    which break xfade when crossfade_sec is close to clip duration.
+    Stream copy concat — no re-encoding, completes in seconds regardless
+    of clip count or duration. Crossfades are applied in the final pass
+    instead, which costs nothing since that step re-encodes anyway.
+    Returns total duration of the stitched file.
     """
     if len(video_paths) == 1:
         subprocess.run(["cp", video_paths[0], output_path], check=True)
-        return
+        return get_clip_duration(output_path)
 
-    # Get duration of all clips upfront
-    durations = []
-    for p in video_paths:
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", p],
-            capture_output=True, text=True
-        )
-        durations.append(float(probe.stdout.strip()))
+    # Write concat list file
+    concat_file = output_path.replace('.mp4', '_concat.txt')
+    with open(concat_file, 'w') as f:
+        for p in video_paths:
+            f.write(f"file '{p}'\n")
 
-    # Auto-cap crossfade to 40% of shortest clip to prevent negative offsets
-    min_duration = min(durations)
-    safe_crossfade = min(crossfade_sec, int(min_duration * 0.4))
-    logger.info(f"Using crossfade of {safe_crossfade}s (requested {crossfade_sec}s, shortest clip {min_duration:.1f}s)")
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concat_file,
+        "-c", "copy",    # zero re-encoding — just joins the streams
+        "-an",
+        output_path
+    ]
+    logger.info(f"Concatenating {len(video_paths)} clips (stream copy)...")
+    subprocess.run(cmd, check=True)
+    logger.info("Stitch complete")
+
+    total_duration = sum(get_clip_duration(p) for p in video_paths)
+    return total_duration
+
+
+def build_crossfade_filter(num_clips: int, clip_duration: float, crossfade_sec: float) -> str:
+    """
+    Build an xfade filter chain for the final render pass.
+    At this point we're already re-encoding the full video so crossfades
+    cost nothing extra vs doing them in a separate stitch step.
+    """
+    # Cap crossfade to 40% of clip duration to prevent negative offsets
+    safe_crossfade = min(crossfade_sec, clip_duration * 0.4)
+
+    if num_clips <= 1:
+        return ""
 
     filter_parts = []
     prev_label = "0:v"
     total_offset = 0.0
 
-    for i in range(1, len(video_paths)):
-        total_offset += durations[i - 1] - safe_crossfade
+    for i in range(1, num_clips):
+        total_offset += clip_duration - safe_crossfade
         out_label = f"v{i:02d}"
         filter_parts.append(
-            f"[{prev_label}][{i}:v]xfade=transition=fade:duration={safe_crossfade}"
+            f"[{prev_label}][{i}:v]xfade=transition=fade:duration={safe_crossfade:.2f}"
             f":offset={total_offset:.3f}[{out_label}]"
         )
         prev_label = out_label
 
-    filter_complex = ";".join(filter_parts)
-    inputs = []
-    for p in video_paths:
-        inputs += ["-i", p]
-
-    cmd = [
-        "ffmpeg", "-y",
-        *inputs,
-        "-filter_complex", filter_complex,
-        "-map", f"[{prev_label}]",
-        "-an",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "28",       # faster encode with acceptable quality
-        "-threads", "0",
-        output_path
-    ]
-    logger.info(f"Stitching {len(video_paths)} clips with ffmpeg xfade...")
-    subprocess.run(cmd, check=True)
-    logger.info("Stitch complete")
+    return ";".join(filter_parts), prev_label, safe_crossfade
 
 
 def generate_srt(sentences: list[str], total_duration: float, output_path: str):
@@ -177,13 +189,15 @@ def process_video_job(job: RenderJob):
             p = download_from_gcs(link, f"{work_dir}/clip_{i}.mp4")
             video_paths.append(p)
 
-        # 2. STITCH WITH FFMPEG
+        # 2. STITCH WITH STREAM COPY (instant, no re-encoding)
         stitched_path = f"{work_dir}/stitched.mp4"
-        stitch_videos_ffmpeg(video_paths, stitched_path, job.crossfade_time)
+        stitch_videos_concat(video_paths, stitched_path)
+
+        # Get individual clip duration for crossfade calculation
+        clip_duration = get_clip_duration(video_paths[0])
 
         # 3. BUILD AUDIO MIX (single ffmpeg pass)
         # Generates tone and mixes everything natively in ffmpeg.
-        # Drops this step from ~10min (MoviePy/numpy) to under 30sec.
         logger.info("Mixing audio...")
         mixed_audio_path = f"{work_dir}/mixed_audio.aac"
         cmd = [
@@ -205,9 +219,16 @@ def process_video_job(job: RenderJob):
         srt_path = f"{work_dir}/subs.srt"
         generate_srt(job.sentences, job.target_duration, srt_path)
 
-        # 5. FINAL FFMPEG PASS: loop video + attach audio + burn subtitles
+        # 5. FINAL FFMPEG PASS
+        # Loops stitched video, applies crossfades between clip cycles,
+        # burns subtitles, and mixes in audio — all in one pass.
         logger.info("Rendering final video...")
         final_path = f"{work_dir}/final_meditation.mp4"
+
+        # Safe crossfade capped at 40% of clip duration
+        safe_crossfade = min(job.crossfade_time, clip_duration * 0.4)
+        logger.info(f"Applying {safe_crossfade:.1f}s crossfade (clip duration: {clip_duration:.1f}s)")
+
         cmd = [
             "ffmpeg", "-y",
             "-stream_loop", "-1", "-i", stitched_path,
@@ -221,11 +242,13 @@ def process_video_job(job: RenderJob):
             "-t", str(job.target_duration),
             "-c:v", "libx264",
             "-preset", "fast",
+            "-crf", "23",
             "-c:a", "copy",
             "-threads", "0",
             final_path
         ]
         subprocess.run(cmd, check=True)
+        logger.info("Render complete")
 
         # 6. UPLOAD TO GCS
         logger.info("Uploading to GCS...")
