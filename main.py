@@ -32,16 +32,19 @@ class RenderJob(BaseModel):
 # HELPERS
 # ---------------------------------------------------------------------------
 
-def download_from_gcs(gcs_uri: str, output_path: str) -> str:
+def download_from_gcs(gcs_uri: str, output_path: str, storage_client: storage.Client) -> str:
     """
-    Use gcloud storage cp directly — proven to work reliably on Cloud Run,
-    avoids SSL EOF issues seen with the Python GCS SDK download_to_filename.
+    Download from GCS using a shared client — reuses the authenticated
+    connection across all downloads instead of reinitializing each time.
+    This avoids the 9-minute overhead seen when creating a new client
+    or subprocess per file.
     """
     logger.info(f"Downloading {gcs_uri}...")
-    subprocess.run(
-        ["gcloud", "storage", "cp", gcs_uri, output_path],
-        check=True
-    )
+    bucket_name = gcs_uri.split('/')[2]
+    blob_name = '/'.join(gcs_uri.split('/')[3:])
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.download_to_filename(output_path, timeout=300)
     logger.info(f"Download complete: {output_path}")
     return output_path
 
@@ -66,7 +69,6 @@ def stitch_videos_concat(video_paths: list[str], output_path: str) -> float:
         subprocess.run(["cp", video_paths[0], output_path], check=True)
         return get_clip_duration(output_path)
 
-    # Write concat list file
     concat_file = output_path.replace('.mp4', '_concat.txt')
     with open(concat_file, 'w') as f:
         for p in video_paths:
@@ -150,11 +152,13 @@ def process_video_job(job: RenderJob):
 
     try:
         # 1. DOWNLOAD FROM GCS
+        # Create client once and reuse across all downloads
         logger.info("Downloading assets...")
-        audio_path = download_from_gcs(job.audio_link, f"{work_dir}/music.mp3")
+        gcs_client = storage.Client()
+        audio_path = download_from_gcs(job.audio_link, f"{work_dir}/music.mp3", gcs_client)
         video_paths = []
         for i, link in enumerate(job.video_links):
-            p = download_from_gcs(link, f"{work_dir}/clip_{i}.mp4")
+            p = download_from_gcs(link, f"{work_dir}/clip_{i}.mp4", gcs_client)
             video_paths.append(p)
 
         # 2. STITCH WITH STREAM COPY (instant, no re-encoding)
@@ -165,8 +169,6 @@ def process_video_job(job: RenderJob):
         clip_duration = get_clip_duration(video_paths[0])
 
         # 3. BUILD AUDIO MIX (single ffmpeg pass)
-        # Generates tone and mixes everything natively in ffmpeg.
-        # Drops this step from ~10min (MoviePy/numpy) to under 30sec.
         logger.info("Mixing audio...")
         mixed_audio_path = f"{work_dir}/mixed_audio.aac"
         cmd = [
@@ -189,11 +191,9 @@ def process_video_job(job: RenderJob):
         generate_srt(job.sentences, job.target_duration, srt_path)
 
         # 5. FINAL FFMPEG PASS
-        # Loops stitched video, burns subtitles, and mixes in audio.
         logger.info("Rendering final video...")
         final_path = f"{work_dir}/final_meditation.mp4"
 
-        # Safe crossfade capped at 40% of clip duration
         safe_crossfade = min(job.crossfade_time, clip_duration * 0.4)
         logger.info(f"Applying {safe_crossfade:.1f}s crossfade (clip duration: {clip_duration:.1f}s)")
 
@@ -220,8 +220,7 @@ def process_video_job(job: RenderJob):
 
         # 6. UPLOAD TO GCS
         logger.info("Uploading to GCS...")
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(os.environ["BUCKET_NAME"])
+        bucket = gcs_client.bucket(os.environ["BUCKET_NAME"])
         blob_name = f"meditation_{uuid.uuid4().hex[:8]}.mp4"
         blob = bucket.blob(blob_name)
         blob.upload_from_filename(
