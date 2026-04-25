@@ -36,8 +36,6 @@ def download_from_gcs(gcs_uri: str, output_path: str, storage_client: storage.Cl
     """
     Download from GCS using a shared client — reuses the authenticated
     connection across all downloads instead of reinitializing each time.
-    This avoids the 9-minute overhead seen when creating a new client
-    or subprocess per file.
     """
     logger.info(f"Downloading {gcs_uri}...")
     bucket_name = gcs_uri.split('/')[2]
@@ -62,8 +60,7 @@ def get_clip_duration(video_path: str) -> float:
 def stitch_videos_concat(video_paths: list[str], output_path: str) -> float:
     """
     Stream copy concat — no re-encoding, completes in seconds regardless
-    of clip count or duration. Crossfades are applied in the final pass
-    instead, which costs nothing since that step re-encodes anyway.
+    of clip count or duration.
     """
     if len(video_paths) == 1:
         subprocess.run(["cp", video_paths[0], output_path], check=True)
@@ -93,8 +90,8 @@ def stitch_videos_concat(video_paths: list[str], output_path: str) -> float:
 
 def generate_srt(sentences: list[str], total_duration: float, output_path: str):
     """
-    Write an SRT subtitle file — ffmpeg burns it in during the final pass.
-    Much faster than MoviePy TextClip/ImageMagick approach.
+    Write an SRT subtitle file — saved alongside the video for
+    optional use by the player or future burn-in step.
     """
     time_per = total_duration / len(sentences)
 
@@ -152,7 +149,6 @@ def process_video_job(job: RenderJob):
 
     try:
         # 1. DOWNLOAD FROM GCS
-        # Create client once and reuse across all downloads
         logger.info("Downloading assets...")
         gcs_client = storage.Client()
         audio_path = download_from_gcs(job.audio_link, f"{work_dir}/music.mp3", gcs_client)
@@ -164,9 +160,6 @@ def process_video_job(job: RenderJob):
         # 2. STITCH WITH STREAM COPY (instant, no re-encoding)
         stitched_path = f"{work_dir}/stitched.mp4"
         stitch_videos_concat(video_paths, stitched_path)
-
-        # Get individual clip duration for crossfade calculation
-        clip_duration = get_clip_duration(video_paths[0])
 
         # 3. BUILD AUDIO MIX (single ffmpeg pass)
         logger.info("Mixing audio...")
@@ -186,41 +179,32 @@ def process_video_job(job: RenderJob):
         subprocess.run(cmd, check=True)
         logger.info("Audio mix complete")
 
-        # 4. GENERATE SRT SUBTITLES
+        # 4. GENERATE SRT (saved to GCS alongside video for reference)
         srt_path = f"{work_dir}/subs.srt"
         generate_srt(job.sentences, job.target_duration, srt_path)
 
         # 5. FINAL FFMPEG PASS
+        # Stream copy video — no re-encoding needed since we removed subtitle burn-in.
+        # Just loop the stitched video and attach the mixed audio.
+        # This completes in seconds instead of minutes.
         logger.info("Rendering final video...")
         final_path = f"{work_dir}/final_meditation.mp4"
-
-        safe_crossfade = min(job.crossfade_time, clip_duration * 0.4)
-        logger.info(f"Applying {safe_crossfade:.1f}s crossfade (clip duration: {clip_duration:.1f}s)")
-
         cmd = [
             "ffmpeg", "-y",
             "-stream_loop", "-1", "-i", stitched_path,
             "-i", mixed_audio_path,
-            "-vf", (
-                f"subtitles={srt_path}:"
-                "force_style='FontName=Helvetica,FontSize=24,"
-                "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-                "BorderStyle=1,Outline=2,Alignment=2'"
-            ),
             "-t", str(job.target_duration),
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "23",
+            "-c:v", "copy",   # no re-encoding — just loop and trim
             "-c:a", "copy",
-            "-threads", "0",
             final_path
         ]
         subprocess.run(cmd, check=True)
         logger.info("Render complete")
 
-        # 6. UPLOAD TO GCS
+        # 6. UPLOAD TO GCS (video + SRT)
         logger.info("Uploading to GCS...")
         bucket = gcs_client.bucket(os.environ["BUCKET_NAME"])
+
         blob_name = f"meditation_{uuid.uuid4().hex[:8]}.mp4"
         blob = bucket.blob(blob_name)
         blob.upload_from_filename(
@@ -230,8 +214,17 @@ def process_video_job(job: RenderJob):
             num_retries=3
         )
 
-        # Signed URL — safer than public bucket, expires in 24h
+        # Also upload the SRT file with the same base name
+        srt_blob_name = blob_name.replace('.mp4', '.srt')
+        srt_blob = bucket.blob(srt_blob_name)
+        srt_blob.upload_from_filename(srt_path, content_type="text/plain")
+
+        # Signed URLs — expire in 24h
         signed_url = blob.generate_signed_url(
+            expiration=timedelta(hours=24),
+            method="GET"
+        )
+        srt_signed_url = srt_blob.generate_signed_url(
             expiration=timedelta(hours=24),
             method="GET"
         )
@@ -240,7 +233,8 @@ def process_video_job(job: RenderJob):
         requests.post(job.callback_webhook, json={
             "status": "success",
             "message": f"Render complete ({job.target_duration}s)",
-            "video_url": signed_url
+            "video_url": signed_url,
+            "srt_url": srt_signed_url
         })
         logger.info(f"Success! Video: {signed_url}")
 
