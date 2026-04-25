@@ -88,10 +88,64 @@ def stitch_videos_concat(video_paths: list[str], output_path: str) -> float:
     return total_duration
 
 
+def mix_audio(audio_path: str, mixed_audio_path: str, target_duration: int,
+              hertz_freq: float, tone_volume: float, work_dir: str):
+    """
+    Three step audio mix — avoids aloop's huge buffer allocation and
+    aevalsrc's slow per-sample Python overhead:
+    1. Loop music by concatenating it with itself enough times to cover duration
+    2. Generate hz tone using sine filter (fast, native C)
+    3. Mix the two together and trim to exact duration
+    """
+    # Step 1 — figure out how many times to repeat the music file
+    music_duration = get_clip_duration(audio_path)
+    repeat_count = int(target_duration / music_duration) + 2
+
+    # Write concat list for music loop
+    music_concat = f"{work_dir}/music_concat.txt"
+    with open(music_concat, 'w') as f:
+        for _ in range(repeat_count):
+            f.write(f"file '{audio_path}'\n")
+
+    looped_music_path = f"{work_dir}/music_looped.aac"
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", music_concat,
+        "-t", str(target_duration),
+        "-c:a", "aac",
+        looped_music_path
+    ], check=True)
+    logger.info("Music loop complete")
+
+    # Step 2 — generate hz tone using sine filter (much faster than aevalsrc)
+    tone_path = f"{work_dir}/tone.aac"
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", f"sine=frequency={hertz_freq}:duration={target_duration}",
+        "-af", f"volume={tone_volume}",
+        "-c:a", "aac",
+        tone_path
+    ], check=True)
+    logger.info("Tone generation complete")
+
+    # Step 3 — mix music and tone together
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-i", looped_music_path,
+        "-i", tone_path,
+        "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=shortest[out]",
+        "-map", "[out]",
+        "-c:a", "aac",
+        mixed_audio_path
+    ], check=True)
+    logger.info("Audio mix complete")
+
+
 def generate_srt(sentences: list[str], total_duration: float, output_path: str):
     """
-    Write an SRT subtitle file — saved alongside the video for
-    optional use by the player or future burn-in step.
+    Write an SRT subtitle file — uploaded to GCS alongside the video.
     """
     time_per = total_duration / len(sentences)
 
@@ -161,32 +215,24 @@ def process_video_job(job: RenderJob):
         stitched_path = f"{work_dir}/stitched.mp4"
         stitch_videos_concat(video_paths, stitched_path)
 
-        # 3. BUILD AUDIO MIX (single ffmpeg pass)
-        logger.info("Mixing audio...")
+        # 3. BUILD AUDIO MIX
+        # Three separate ffmpeg calls instead of one complex filter chain.
+        # Avoids aloop's 2-billion-sample buffer allocation which was
+        # causing 0.1x speed on Cloud Run.
         mixed_audio_path = f"{work_dir}/mixed_audio.aac"
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", audio_path,
-            "-filter_complex", (
-                f"aevalsrc=sin(2*PI*{job.hertz_freq}*t)*{job.tone_volume}:s=44100:d={job.target_duration}[tone];"
-                f"[0:a]aloop=loop=-1:size=2e+09,atrim=duration={job.target_duration}[music];"
-                "[music][tone]amix=inputs=2:duration=first[out]"
-            ),
-            "-map", "[out]",
-            "-c:a", "aac",
-            mixed_audio_path
-        ]
-        subprocess.run(cmd, check=True)
-        logger.info("Audio mix complete")
+        mix_audio(
+            audio_path, mixed_audio_path,
+            job.target_duration, job.hertz_freq,
+            job.tone_volume, work_dir
+        )
 
-        # 4. GENERATE SRT (saved to GCS alongside video for reference)
+        # 4. GENERATE SRT
         srt_path = f"{work_dir}/subs.srt"
         generate_srt(job.sentences, job.target_duration, srt_path)
 
         # 5. FINAL FFMPEG PASS
-        # Stream copy video — no re-encoding needed since we removed subtitle burn-in.
-        # Just loop the stitched video and attach the mixed audio.
-        # This completes in seconds instead of minutes.
+        # Stream copy video — no re-encoding, just loop and trim.
+        # Completes in seconds.
         logger.info("Rendering final video...")
         final_path = f"{work_dir}/final_meditation.mp4"
         cmd = [
@@ -194,14 +240,14 @@ def process_video_job(job: RenderJob):
             "-stream_loop", "-1", "-i", stitched_path,
             "-i", mixed_audio_path,
             "-t", str(job.target_duration),
-            "-c:v", "copy",   # no re-encoding — just loop and trim
+            "-c:v", "copy",
             "-c:a", "copy",
             final_path
         ]
         subprocess.run(cmd, check=True)
         logger.info("Render complete")
 
-        # 6. UPLOAD TO GCS (video + SRT)
+        # 6. UPLOAD TO GCS
         logger.info("Uploading to GCS...")
         bucket = gcs_client.bucket(os.environ["BUCKET_NAME"])
 
@@ -214,7 +260,7 @@ def process_video_job(job: RenderJob):
             num_retries=3
         )
 
-        # Also upload the SRT file with the same base name
+        # Also upload SRT alongside the video
         srt_blob_name = blob_name.replace('.mp4', '.srt')
         srt_blob = bucket.blob(srt_blob_name)
         srt_blob.upload_from_filename(srt_path, content_type="text/plain")
